@@ -1,0 +1,313 @@
+package dnsgen
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/sirupsen/logrus"
+	"golang.org/x/net/publicsuffix"
+)
+
+// DomainPartsType represents the parts of a domain name.
+type DomainPartsType []string
+
+// PermutatorFunc is a function that takes domain parts and returns a list of permutations.
+type PermutatorFunc func(DomainPartsType) []string
+
+// DomainGenerator handles domain name permutations.
+type DomainGenerator struct {
+	Words           []string
+	NumCount        int
+	Permutators     []PermutatorFunc
+	FastPermutators []PermutatorFunc
+	FastMode        bool
+	Logger          *logrus.Logger
+}
+
+// NewDomainGenerator creates and initializes a new DomainGenerator.
+func NewDomainGenerator(wordlistPath string, logger *logrus.Logger) (*DomainGenerator, error) {
+	if wordlistPath == "" {
+		// Get the directory of the current file
+		currentDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+		if err != nil {
+			return nil, fmt.Errorf("failed to get current directory: %w", err)
+		}
+		wordlistPath = filepath.Join(currentDir, "words.txt")
+	}
+
+	file, err := os.Open(wordlistPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open wordlist file: %w", err)
+	}
+	defer file.Close()
+
+	var words []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			words = append(words, line)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read wordlist file: %w", err)
+	}
+
+	return &DomainGenerator{
+		Words:           words,
+		NumCount:        3,
+		Permutators:     make([]PermutatorFunc, 0),
+		FastPermutators: make([]PermutatorFunc, 0),
+		FastMode:        false,
+		Logger:          logger,
+	}, nil
+}
+
+// RegisterPermutator registers a domain permutation function.
+func (g *DomainGenerator) RegisterPermutator(fast bool, permFunc PermutatorFunc) {
+	if fast {
+		g.FastPermutators = append(g.FastPermutators, permFunc)
+	} else {
+		g.Permutators = append(g.Permutators, permFunc)
+	}
+}
+
+// PartiateDomain splits a domain based on subdomain levels.
+func (g *DomainGenerator) PartiateDomain(domain string) DomainPartsType {
+	// Get the effective top-level domain plus one (eTLD+1)
+	eTLDPlus1, err := publicsuffix.EffectiveTLDPlusOne(domain)
+	if err != nil {
+		g.Logger.WithError(err).Error("Error parsing domain")
+		panic(err) // Handle error appropriately in your application
+	}
+
+	// Extract the root domain (eTLD+1)
+	rootDomain := eTLDPlus1
+
+	// Get the subdomain part
+	subdomain := strings.TrimSuffix(domain, "."+rootDomain)
+
+	// Split the subdomain into parts
+	subdomainParts := strings.Split(subdomain, ".")
+
+	// Combine subdomain parts and root domain
+	parts := append(subdomainParts, rootDomain)
+
+	return parts
+}
+
+// ActivePermutators returns the list of currently active permutators.
+func (g *DomainGenerator) ActivePermutators() []PermutatorFunc {
+	if g.FastMode {
+		return g.FastPermutators
+	}
+	return g.Permutators
+}
+
+// Generate generates domain permutations from provided domains.
+func (g *DomainGenerator) Generate(domains []string, wordLen int, fastMode bool) []string {
+	g.FastMode = fastMode
+	var results []string
+
+	g.Logger.WithField("domains", domains).Debug("Generating variations for domains")
+
+	for _, domain := range domains {
+		parts := g.PartiateDomain(domain)
+		g.Logger.WithFields(logrus.Fields{
+			"domain": domain,
+			"parts":  parts,
+		}).Debug("Parts for domain")
+
+		for i, permutator := range g.ActivePermutators() {
+			g.Logger.WithField("permutator", i).Debug("Applying permutator")
+			variations := permutator(parts)
+			g.Logger.WithFields(logrus.Fields{
+				"permutator": i,
+				"variations": variations,
+			}).Debug("Variations from permutator")
+			results = append(results, variations...)
+		}
+	}
+
+	return results
+}
+
+func (g *DomainGenerator) RegisterDefaultPermutators() {
+	g.Logger.Debug("Registering default permutators")
+	g.RegisterPermutator(false, g.insertWordEveryIndex)
+	g.RegisterPermutator(true, g.modifyNumbers)
+	g.RegisterPermutator(false, g.environmentPrefix)
+	g.RegisterPermutator(false, g.cloudProviderAdditions)
+	g.RegisterPermutator(false, g.regionPrefixes)
+	g.RegisterPermutator(false, g.microservicePatterns)
+	g.RegisterPermutator(false, g.internalTooling)
+	g.RegisterPermutator(true, g.commonPorts)
+}
+
+// insertWordEveryIndex inserts words between existing domain levels.
+func (g *DomainGenerator) insertWordEveryIndex(parts DomainPartsType) []string {
+	var domains []string
+	for _, w := range g.Words {
+		for i := range parts {
+			if i < len(parts)-1 { // Check to avoid index out of range
+				tmpParts := make(DomainPartsType, len(parts)-1)
+				copy(tmpParts, parts[:len(parts)-1])
+				tmpParts = append(tmpParts[:i], append([]string{w}, tmpParts[i:]...)...)
+				domains = append(domains, strings.Join(append(tmpParts, parts[len(parts)-1]), "."))
+			}
+		}
+	}
+	g.Logger.WithField("domains", domains).Debug("Domains generated by insertWordEveryIndex")
+	return domains
+}
+
+// modifyNumbers increases and decreases numbers found in domain parts.
+func (g *DomainGenerator) modifyNumbers(parts DomainPartsType) []string {
+	var domains []string
+	partsJoined := strings.Join(parts[:len(parts)-1], ".") // Use all parts except the last one
+	re := regexp.MustCompile(`\d{1,3}`)
+	digits := re.FindAllString(partsJoined, -1)
+
+	for _, d := range digits {
+		for m := 0; m < g.NumCount; m++ {
+			replacement := fmt.Sprintf("%0*d", len(d), toInt(d)+1+m)
+			tmpDomain := strings.Replace(partsJoined, d, replacement, 1)
+			domains = append(domains, fmt.Sprintf("%s.%s", tmpDomain, parts[len(parts)-1]))
+		}
+
+		for m := 0; m < g.NumCount; m++ {
+			newDigit := toInt(d) - 1 - m
+			if newDigit >= 0 {
+				replacement := fmt.Sprintf("%0*d", len(d), newDigit)
+				tmpDomain := strings.Replace(partsJoined, d, replacement, 1)
+				domains = append(domains, fmt.Sprintf("%s.%s", tmpDomain, parts[len(parts)-1]))
+			}
+		}
+	}
+	g.Logger.WithField("domains", domains).Debug("Domains generated by modifyNumbers")
+	return domains
+}
+
+// environmentPrefix adds common environment prefixes to domain parts.
+func (g *DomainGenerator) environmentPrefix(parts DomainPartsType) []string {
+	environments := []string{"dev", "staging", "uat", "prod", "test"}
+	var domains []string
+
+	for _, env := range environments {
+		tmpParts := make(DomainPartsType, len(parts)-1)
+		copy(tmpParts, parts[:len(parts)-1]) // Use all parts except the last one
+		tmpParts = append([]string{env}, tmpParts...)
+		domains = append(domains, strings.Join(append(tmpParts, parts[len(parts)-1]), "."))
+	}
+	g.Logger.WithField("domains", domains).Debug("Domains generated by environmentPrefix")
+	return domains
+}
+
+// cloudProviderAdditions adds common cloud provider related subdomains.
+func (g *DomainGenerator) cloudProviderAdditions(parts DomainPartsType) []string {
+	cloudTerms := []string{"aws", "azure", "gcp", "k8s", "cloud"}
+	serviceTerms := []string{"api", "cdn", "storage", "auth", "db"}
+	var domains []string
+
+	for _, term := range cloudTerms {
+		for _, service := range serviceTerms {
+			tmpParts := make(DomainPartsType, len(parts)-1)
+			copy(tmpParts, parts[:len(parts)-1]) // Use all parts except the last one
+			tmpParts = append([]string{fmt.Sprintf("%s-%s", service, term)}, tmpParts...)
+			domains = append(domains, strings.Join(append(tmpParts, parts[len(parts)-1]), "."))
+		}
+	}
+	g.Logger.WithField("domains", domains).Debug("Domains generated by cloudProviderAdditions")
+	return domains
+}
+
+// regionPrefixes adds common region/location prefixes to domain parts.
+func (g *DomainGenerator) regionPrefixes(parts DomainPartsType) []string {
+	regions := []string{"us-east", "us-west", "eu-west", "eu-central", "ap-south", "ap-northeast", "sa-east", "af-south"}
+	var domains []string
+
+	for _, region := range regions {
+		tmpParts := make(DomainPartsType, len(parts)-1)
+		copy(tmpParts, parts[:len(parts)-1]) // Use all parts except the last one
+		tmpParts = append([]string{region}, tmpParts...)
+		domains = append(domains, strings.Join(append(tmpParts, parts[len(parts)-1]), "."))
+	}
+	g.Logger.WithField("domains", domains).Debug("Domains generated by regionPrefixes")
+	return domains
+}
+
+// microservicePatterns adds common microservice naming patterns.
+func (g *DomainGenerator) microservicePatterns(parts DomainPartsType) []string {
+	services := []string{"auth", "user", "payment", "notification", "order", "inventory"}
+	suffixes := []string{"service", "svc", "api", "app"}
+	var domains []string
+
+	for _, service := range services {
+		for _, suffix := range suffixes {
+			tmpParts := make(DomainPartsType, len(parts)-1)
+			copy(tmpParts, parts[:len(parts)-1]) // Use all parts except the last one
+			tmpParts = append([]string{fmt.Sprintf("%s-%s", service, suffix)}, tmpParts...)
+			domains = append(domains, strings.Join(append(tmpParts, parts[len(parts)-1]), "."))
+		}
+	}
+	g.Logger.WithField("domains", domains).Debug("Domains generated by microservicePatterns")
+	return domains
+}
+
+// internalTooling adds common internal tool and platform subdomains.
+func (g *DomainGenerator) internalTooling(parts DomainPartsType) []string {
+	tools := []string{"jenkins", "gitlab", "grafana", "kibana", "prometheus", "monitoring", "jira"}
+	prefixes := []string{"internal", "tools", "admin"}
+	var domains []string
+
+	for _, tool := range tools {
+		for _, prefix := range prefixes {
+			tmpParts := make(DomainPartsType, 0, len(parts)+1)
+			copy(tmpParts, parts[:len(parts)-1]) // Use all parts except the last one
+			tmpParts = append(tmpParts, prefix, tool)
+			domains = append(domains, strings.Join(append(tmpParts, parts[len(parts)-1]), "."))
+
+			tmpParts = make(DomainPartsType, 0, len(parts)+1)
+			copy(tmpParts, parts[:len(parts)-1]) // Use all parts except the last one
+			tmpParts = append(tmpParts, tool, prefix)
+			domains = append(domains, strings.Join(append(tmpParts, parts[len(parts)-1]), "."))
+		}
+	}
+	g.Logger.WithField("domains", domains).Debug("Domains generated by internalTooling")
+	return domains
+}
+
+// commonPorts adds common port numbers as prefixes.
+func (g *DomainGenerator) commonPorts(parts DomainPartsType) []string {
+	ports := []string{"8080", "8443", "3000", "5000", "9000", "8888"}
+	var domains []string
+
+	for _, port := range ports {
+		tmpParts := make(DomainPartsType, len(parts)-1)
+		copy(tmpParts, parts[:len(parts)-1]) // Use all parts except the last one
+		tmpParts = append([]string{port}, tmpParts...)
+		domains = append(domains, strings.Join(append(tmpParts, parts[len(parts)-1]), "."))
+
+		tmpParts = make(DomainPartsType, len(parts)-1)
+		copy(tmpParts, parts[:len(parts)-1]) // Use all parts except the last one
+		tmpParts = append([]string{fmt.Sprintf("port-%s", port)}, tmpParts...)
+		domains = append(domains, strings.Join(append(tmpParts, parts[len(parts)-1]), "."))
+	}
+	g.Logger.WithField("domains", domains).Debug("Domains generated by commonPorts")
+	return domains
+}
+
+// Helper function to convert string to int, with error handling
+func toInt(s string) int {
+	var result int
+	_, err := fmt.Sscan(s, &result)
+	if err != nil {
+		return 0 // Handle error as appropriate
+	}
+	return result
+}
